@@ -1,109 +1,117 @@
-import requests
 import pandas as pd
+import requests
 import streamlit as st
 
-st.title("📊 Calculadora de Inflación Personal")
+st.set_page_config(page_title="Inflación y poder adquisitivo", page_icon="📊")
+st.title("📊 Inflación por subclase (IPC)")
 st.write(
-    "Selecciona un grupo y una categoría para consultar el dato de inflación más reciente."
+    "Añade gastos por categoría para guardarlos en una tabla y ver el total acumulado y la pérdida de poder adquisitivo."
 )
 
-NOMBRES_GRUPOS = {
-    "00": "Índice general",
-    "01": "01 Alimentos y bebidas no alcohólicas",
-    "02": "02 Bebidas alcohólicas y tabaco",
-    "03": "03 Vestido y calzado",
-    "04": "04 Vivienda, agua, electricidad, gas y otros combustibles",
-    "05": "05 Muebles, artículos del hogar y artículos para el mantenimiento corriente del hogar",
-    "06": "06 Sanidad",
-    "07": "07 Transporte",
-    "08": "08 Información y comunicaciones",
-    "09": "09 Actividades recreativas, deporte y cultura",
-    "10": "10 Enseñanza",
-    "11": "11 Restaurantes y servicios de alojamiento",
-    "12": "12 Seguros y servicios financieros",
-    "13": "13 Cuidado personal, protección social, y bienes y servicios diversos",
-}
 
+@st.cache_data(ttl=3600)
 def cargar_datos():
-    URL="https://servicios.ine.es/wstempus/js/ES/DATOS_TABLA/79184?date=20260701:"
-    URL2="https://servicios.ine.es/wstempus/js/ES/VALORES_GRUPOSTABLA/79184/161050"
+    url = "https://servicios.ine.es/wstempus/js/ES/DATOS_TABLA/79184?date=20260701"
+    respuesta = requests.get(url, timeout=30)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
 
-    datos=requests.get(URL).json()
-    datosgrupos=requests.get(URL2).json()
-    tablagrupos=[]
-    for elemento in datosgrupos:
-       Nombre=elemento["Nombre"]
-       Grupo=elemento["Codigo"][:2]
-       tablagrupos.append({"Nombre":Nombre,"Grupo":Grupo})
-
-    dfgrupos=pd.DataFrame(tablagrupos)
-
-    tabla=[]
-
+    registros = []
     for serie in datos:
-        if "Variación anual" in serie["Nombre"]:
-            valor=serie["Data"][0]["Valor"]
-            Categoria=serie["Nombre"].replace("Nacional. ", "").replace(". Variación anual.", "").strip()
-            Mes= serie["Data"][0]["FK_Periodo"]
-            Año= serie["Data"][0]["Anyo"]
-            tabla.append({"Categoria":Categoria,"Valor":valor,"Mes":Mes,"Año":Año})
+        if "Variación anual" in serie.get("Nombre", ""):
+            nombre_limpio = (
+                serie["Nombre"]
+                .replace("Nacional. ", "")
+                .replace(". Variación anual. ", "")
+                .strip()
+            )
+            obs = serie.get("Data", [])
+            if obs and obs[0].get("Valor") is not None:
+                registros.append(
+                    {
+                        "Categoria": nombre_limpio,
+                        "Valor": float(obs[0]["Valor"]),
+                    }
+                )
+    return pd.DataFrame(registros)
 
 
-    df=pd.DataFrame(tabla)
-    dfgrupos["Nombre"] = dfgrupos["Nombre"].str.strip()
+# Inicializar historial de gastos en session_state
+if "gastos" not in st.session_state:
+    st.session_state.gastos = []
 
+df_ine = cargar_datos()
 
-    df_final= pd.merge(df,dfgrupos,left_on="Categoria", right_on="Nombre", how="left")
-    df_final = df_final.drop(columns=["Nombre"])
-    df_final["Nombre_Grupo"] = df_final["Grupo"].map(NOMBRES_GRUPOS)
-    return df_final
+# --- 1. FORMULARIO PARA AÑADIR UN GASTO ---
+with st.form("form_gasto", clear_on_submit=True):
+    categoria_seleccionada = st.selectbox(
+        "Selecciona una categoría de gasto:",
+        df_ine["Categoria"].unique(),
+    )
+    gasto_actual = st.number_input(
+        "Introduce el gasto (€):",
+        min_value=0.0,
+        value=50.0,
+        step=1.0,
+        format="%.2f",
+    )
+    enviado = st.form_submit_button("➕ Añadir gasto")
 
-df_final=cargar_datos()
+if enviado and gasto_actual > 0:
+    inflacion = float(
+        df_ine[df_ine["Categoria"] == categoria_seleccionada].iloc[0]["Valor"]
+    )
+    factor = 1 + (inflacion / 100)
+    valor_hace_un_ano = gasto_actual / factor if factor != 0 else gasto_actual
+    perdida_euros = gasto_actual - valor_hace_un_ano
 
-# 2. Mostramos en el selectbox los nombres amigables de los grupos
-lista_grupos = sorted(df_final["Nombre_Grupo"].dropna().unique())
-
-# 1. Tu primer selector con st.segmented_control
-grupo_seleccionado = st.segmented_control(
-    "Selecciona el grupo de gasto:", lista_grupos
-)
-
-# Comprobamos que el usuario haya seleccionado un grupo antes de continuar
-if grupo_seleccionado:
-
-    # 2. Filtrar el DataFrame según el grupo que ha pinchado el usuario
-    df_grupo = df_final[df_final["Nombre_Grupo"] == grupo_seleccionado]
-
-    # 3. Obtener la lista de subclases de ese grupo específico
-    lista_subclases = sorted(df_grupo["Categoria"].unique())
-
-    # 4. Segundo selector (selectbox es ideal aquí porque hay muchas subclases)
-    subclase_seleccionada = st.selectbox(
-        "Selecciona la subclase concreta:", lista_subclases
+    st.session_state.gastos.append(
+        {
+            "Categoria": categoria_seleccionada,
+            "Gasto actual (€)": round(gasto_actual, 2),
+            "Inflación (%)": round(inflacion, 2),
+            "Equivalente hace 1 año (€)": round(valor_hace_un_ano, 2),
+            "Pérdida poder adquisitivo (€)": round(perdida_euros, 2),
+        }
     )
 
-# 5. Buscamos la fila correspondiente a la subclase seleccionada
-    datos_subclase = df_grupo[df_grupo["Categoria"] == subclase_seleccionada]
+# --- 2. DATAFRAME ACUMULADO Y FILA TOTAL ABAJO ---
+st.divider()
+st.subheader("Registro de gastos")
 
-    # Obtenemos los valores de esa fila
-    inflacion = datos_subclase["Valor"].values[0]
-    mes = datos_subclase["Mes"].values[0]
-    anyo = datos_subclase["Año"].values[0]
+if st.session_state.gastos:
+    df_gastos = pd.DataFrame(st.session_state.gastos)
 
-    st.divider()  # Línea separadora visual
+    total_gasto = df_gastos["Gasto actual (€)"].sum()
+    total_hace_un_ano = df_gastos["Equivalente hace 1 año (€)"].sum()
+    total_perdida = df_gastos["Pérdida poder adquisitivo (€)"].sum()
+    inflacion_media = df_gastos["Inflación (%)"].mean()
 
-    # 6. Mostramos el dato de inflación en destacado
-    st.metric(
-        label=f"Inflación anual: {subclase_seleccionada}",
-        value=f"{inflacion} %",
-        delta=f"{inflacion} %",
-        delta_color="inverse",  # Si sube se muestra en rojo (negativo para la cartera)
+    fila_total = pd.DataFrame(
+        [
+            {
+                "Categoria": "TOTAL",
+                "Gasto actual (€)": round(total_gasto, 2),
+                "Inflación (%)": round(inflacion_media, 2),
+                "Equivalente hace 1 año (€)": round(total_hace_un_ano, 2),
+                "Pérdida poder adquisitivo (€)": round(total_perdida, 2),
+            }
+        ]
     )
 
-    st.caption(f"📅 Dato más reciente de la API: Mes {mes} del año {anyo}")
+    df_con_total = pd.concat([df_gastos, fila_total], ignore_index=True)
+    st.dataframe(df_con_total, use_container_width=True, hide_index=True)
 
-print(df_final)
-                
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Gasto total actual", f"{total_gasto:.2f} €")
+    with col2:
+        st.metric("Equivalente total hace 1 año", f"{total_hace_un_ano:.2f} €")
+    with col3:
+        st.metric("Pérdida total de poder adquisitivo", f"{total_perdida:.2f} €")
 
-
-
+    if st.button("🗑️ Borrar todos los gastos"):
+        st.session_state.gastos = []
+        st.rerun()
+else:
+    st.info("Todavía no has añadido ningún gasto. Usa el formulario de arriba para empezar.")
